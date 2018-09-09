@@ -1,0 +1,140 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Dec 31 14:40:52 2016 @author: Haibo Shi
+"""
+import numpy as np
+import tensorflow as tf
+from plant_dynamics import plantDynamics
+
+kf=25
+dt=0.1
+dimState = 4
+dimContext = 4
+dimAction = 2
+centerTheta = np.array([np.pi*2/12,np.pi*7/12,0,0])
+targetTheta = np.array([0.2099,1.5974,0,0])
+arm_states = {'start':centerTheta,'target':targetTheta}
+
+batch_size = 1;
+learning_rate = 5e-5;
+num_hidden = 64
+# Create the model
+input_data = tf.placeholder(tf.float32, [batch_size, kf,8])
+input_single = tf.placeholder(tf.float32, [batch_size, 8])
+c_state = tf.placeholder(tf.float32, [batch_size, num_hidden])
+h_state = tf.placeholder(tf.float32, [batch_size, num_hidden])
+state_single_input = tf.nn.rnn_cell.LSTMStateTuple(c_state, h_state)
+action_gradient = tf.placeholder(tf.float32, [batch_size, kf,dimAction])
+context_variable_pose = tf.Variable(tf.truncated_normal([batch_size,2]))
+context_variable = tf.concat(1, [context_variable_pose,tf.zeros([1,2])])
+cell = tf.nn.rnn_cell.BasicLSTMCell(num_hidden)#cell = tf.nn.rnn_cell.BasicRNNCell(num_hidden)
+with tf.variable_scope("M1") as RNN_scope:
+    output_single, state_single_output = cell(input_single, state_single_input)    
+    RNN_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=RNN_scope.name)
+cell_outputs = []
+cell_state = cell.zero_state(batch_size, tf.float32)
+with tf.variable_scope("M1",reuse = True):
+    for time_step in range(kf):
+        (cell_output, cell_state) = cell(input_data[:, time_step, :], cell_state)
+        cell_outputs.append(cell_output)
+    outputs_pack = tf.pack(cell_outputs)
+    outputs_transpose = tf.transpose(outputs_pack,[1,0,2])
+solid_cell_state = cell.zero_state(batch_size, tf.float32)
+solid_cell_outputs = []
+
+
+
+
+with tf.variable_scope("M1",reuse = True):
+    for time_step in range(kf):
+        solid_cell_input = tf.concat(1,[input_data[:, time_step, 0:dimState],context_variable])
+        (solid_cell_output, solid_cell_state) = cell(solid_cell_input, solid_cell_state)
+        solid_cell_outputs.append(solid_cell_output)
+    solid_outputs_pack = tf.pack(solid_cell_outputs)
+    solid_outputs_transpose = tf.transpose(solid_outputs_pack,[1,0,2])
+
+weight = tf.Variable(tf.truncated_normal([num_hidden, dimAction])/num_hidden)
+bias = tf.Variable(tf.constant(0.1, shape=[dimAction]))
+final_projection = lambda x: tf.nn.tanh(tf.matmul(x, weight) + bias)
+
+
+
+y_single = final_projection(output_single)
+y_seq = tf.map_fn(final_projection, outputs_transpose) #batch_multiplicate
+solid_y_seq = tf.map_fn(final_projection, solid_outputs_transpose)
+
+network_params = tf.trainable_variables()
+actor_gradients = tf.gradients(y_seq[0], network_params, -action_gradient[0])
+train_batch = tf.train.AdamOptimizer(learning_rate).\
+            apply_gradients(zip(actor_gradients, network_params)) 
+solid_network_params = [context_variable_pose]
+context_gradients = tf.gradients(solid_y_seq[0], solid_network_params, -action_gradient[0])
+train_context_batch = tf.train.AdamOptimizer(learning_rate).\
+            apply_gradients(zip(context_gradients, solid_network_params))
+            
+            
+            
+sess = tf.InteractiveSession()
+sess.run(tf.global_variables_initializer())
+
+
+
+
+
+dXfdX = 1e-1*np.zeros([kf,dimState,dimState])
+dXfdU = 1e-1*np.zeros([kf,dimState,dimAction])
+episode_x = np.zeros([kf,dimState+dimContext])
+episode_grad_a = np.zeros([kf,dimAction])
+x_batch = np.zeros([batch_size,kf,dimState+dimContext])
+grad_a_batch = np.zeros([batch_size,kf,dimAction])
+observations, inlets, dXdotdX, dXdotdU =[],[],[],[]
+net_state = (np.zeros([batch_size, num_hidden]),np.zeros([batch_size, num_hidden]))
+#'random' for generating random points, 'fixed' for th example start and target points
+plant = plantDynamics('fixed',kf,arm_states) 
+#%%
+for episode in range(np.int(2e5)):
+    batch_ind = 0    
+    observation = plant.reset()
+    context = plant.taskCfg['states']['target']
+    for k in range(kf):
+        inlet = np.concatenate([observation,context])
+        inlets.append(inlet)
+        action, net_state = sess.run([y_single, state_single_output], \
+                                     feed_dict={input_single:np.reshape(inlet, (1, dimState+dimContext)),\
+                                                c_state: net_state[0], h_state: net_state[1]})
+        new_observation, error, done, info = plant.step(action[0])
+        observations.append(observation)        
+        observation = new_observation       
+        dXdotdX.append(info['dXdotdX'])
+        dXdotdU.append(info['dXdotdU'])         
+
+        # backward sweep
+    for k in reversed(range(kf)):
+        if k==kf-1:
+            dXfdX[k]=dt*(dXdotdX[k])+np.eye(dimState)
+            dXfdU[k]=dt*np.dot(dXfdX[k],dXdotdU[k])             
+        else:
+            dXfdX[k]=dt*np.dot(dXfdX[k+1],dXdotdX[k])+dXfdX[k+1]
+            dXfdU[k]=dt*np.dot(dXfdX[k+1],dXdotdU[k])
+            
+            
+        grad_a = np.dot(dXfdU[k].T,error)       
+        episode_x[k] =  np.reshape(inlets[k], (dimState+dimContext,))
+        episode_grad_a[k] = np.reshape(grad_a, (dimAction,))
+    x_batch[batch_ind] = episode_x
+    grad_a_batch[batch_ind] = episode_grad_a 
+    print ' | Episode', episode, '| error: ', np.dot(error,error)  
+    net_state = (np.zeros([batch_size, num_hidden]),np.zeros([batch_size, num_hidden]))
+#    sess.run(tf.initialize_variables([state_single]))
+#    if episode==2500: break
+    observations, inlets,dXdotdX, dXdotdU = [],[],[],[]
+    batch_ind +=1
+    if batch_ind==batch_size:
+        batch_ind =0
+        if episode<2000:
+            sess.run(train_batch,feed_dict={input_data:x_batch,action_gradient:grad_a_batch})
+        else:
+            sess.run(train_context_batch,feed_dict={input_data:x_batch,action_gradient:grad_a_batch})
+
+
